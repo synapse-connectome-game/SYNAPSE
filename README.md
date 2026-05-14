@@ -46,6 +46,8 @@ This game probes many of the same motor and perceptual demands present in typing
 
 ## Running
 
+### Local
+
 ```bash
 bash run.sh
 # then open http://localhost:5050
@@ -53,7 +55,13 @@ bash run.sh
 
 `run.sh` creates a Python virtualenv, installs Flask and NumPy, and starts the server. The browser client uses Three.js loaded from a CDN import map.
 
-The neuron mesh OBJ files are already loaded in `frontend/static/meshes`, and were retrieved via **[cloud-volume](https://github.com/seung-lab/cloud-volume)** through the `setup_meshes.py` script. 
+The neuron mesh OBJ files are already loaded in `frontend/static/meshes`, and were retrieved via **[cloud-volume](https://github.com/seung-lab/cloud-volume)** through the `setup_meshes.py` script.
+
+### Web Version
+
+The game can also be played directly in the browser via GitHub Pages:
+
+https://synapse-connectome-game.github.io/SYNAPSE/
 
 ## Codebase
 
