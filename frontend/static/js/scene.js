@@ -1,0 +1,355 @@
+/**
+ * Three.js scene — camera, renderer, post-processing, neuron mesh management.
+ */
+import * as THREE                from 'three';
+import { TrackballControls }     from 'three/addons/controls/TrackballControls.js';
+import { EffectComposer }        from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass }            from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass }       from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass }            from 'three/addons/postprocessing/OutputPass.js';
+
+import {
+  NEURON_LABELS, NEURON_COLORS, NEURON_POSITIONS,
+  buildNeuronGroup, buildBackgroundNeuron, loadMeshNeuron,
+} from './neurons.js';
+import {
+  startFiringAnimation,
+  spawnPersistentArc, spawnParticleBurst,
+  drainBloomQueue, EXC_COLOR, INH_COLOR,
+} from './effects.js';
+
+const BG_NEURON_COUNT = 220;
+const BG_SPREAD       = 900;
+
+export class NeuronScene {
+  constructor(container) {
+    this._container = container;
+    this._neuronGroups    = new Map(); 
+    this._neuronPositions = new Map(); 
+    this._labelEls        = new Map(); 
+    this._tickFns         = [];        
+
+    this._currentFiringStop  = null;   
+    this._currentFiringLabel = null;   
+    this._persistentArcs     = [];    
+
+    this._clock = new THREE.Clock();
+
+    this._initRenderer();
+    this._initScene();
+    this._initLights();
+    this._initPostProcessing();
+    this._initControls();
+    this._animate();
+  }
+
+  // setup
+
+  _initRenderer() {
+    this._renderer = new THREE.WebGLRenderer({ antialias: true });
+    this._renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    this._renderer.setSize(window.innerWidth, window.innerHeight);
+    this._renderer.toneMapping         = THREE.ReinhardToneMapping;
+    this._renderer.toneMappingExposure = 1.2;
+    this._container.appendChild(this._renderer.domElement);
+    window.addEventListener('resize', () => this._onResize());
+  }
+
+  _initScene() {
+    this._scene  = new THREE.Scene();
+    this._scene.background = new THREE.Color(0x020408);
+    this._scene.fog        = new THREE.FogExp2(0x020408, 0.00012);
+
+    this._camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.5, 8000);
+    this._camera.position.set(0, 40, 725);
+  }
+
+  _initLights() {
+    this._scene.add(new THREE.AmbientLight(0x112233, 0.9));
+
+    const d1 = new THREE.DirectionalLight(0x4466cc, 0.8);
+    d1.position.set(200, 400, 300);
+    this._scene.add(d1);
+
+    const d2 = new THREE.DirectionalLight(0x221133, 0.4);
+    d2.position.set(-200, -100, -300);
+    this._scene.add(d2);
+  }
+
+  _initPostProcessing() {
+    const sz  = new THREE.Vector2(window.innerWidth, window.innerHeight);
+    const rp  = new RenderPass(this._scene, this._camera);
+    const bp  = new UnrealBloomPass(sz, 1.2, 0.5, 0.55);
+    const out = new OutputPass();
+
+    this._composer = new EffectComposer(this._renderer);
+    this._composer.addPass(rp);
+    this._composer.addPass(bp);
+    this._composer.addPass(out);
+  }
+
+  _initControls() {
+    this._controls = new TrackballControls(this._camera, this._renderer.domElement);
+    this._controls.rotateSpeed           = 1.5;
+    this._controls.zoomSpeed             = 1.2;
+    this._controls.panSpeed              = 0.8;
+    this._controls.minDistance           = 80;
+    this._controls.maxDistance           = 2500;
+    this._controls.staticMoving          = false;
+    this._controls.dynamicDampingFactor  = 0.1;
+
+    this._autoRotate      = false;
+    this._userInteracting = false;
+
+    const dom = this._renderer.domElement;
+    dom.addEventListener('mousedown',  () => { this._userInteracting = true;  });
+    dom.addEventListener('touchstart', () => { this._userInteracting = true;  }, { passive: true });
+    window.addEventListener('mouseup',   () => { this._userInteracting = false; });
+    window.addEventListener('touchend',  () => { this._userInteracting = false; });
+  }
+
+  _onResize() {
+    const w = window.innerWidth, h = window.innerHeight;
+    this._camera.aspect = w / h;
+    this._camera.updateProjectionMatrix();
+    this._renderer.setSize(w, h);
+    this._composer.setSize(w, h);
+  }
+
+  // population background neurons
+
+  addBackgroundNeurons() {
+    for (let i = 0; i < BG_NEURON_COUNT; i++) {
+      const g = buildBackgroundNeuron(i);
+      const theta = Math.random() * Math.PI * 2;
+      const phi   = Math.acos(2 * Math.random() - 1);
+      const r     = BG_SPREAD * 0.4 + Math.random() * BG_SPREAD * 0.6;
+      g.position.set(
+        r * Math.sin(phi) * Math.cos(theta),
+        r * Math.sin(phi) * Math.sin(theta) * 0.6,
+        r * Math.cos(phi),
+      );
+      g.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI);
+      g.scale.setScalar(0.5 + Math.random() * 1.5);
+      this._scene.add(g);
+    }
+  }
+
+    // foreground neurons
+
+  async addForegroundNeurons(neuronManifest = [], onProgress = null) {
+    const labelsContainer = document.getElementById('labels-container');
+    const manifestByLabel = Object.fromEntries(neuronManifest.map(m => [m.label, m]));
+
+    for (let i = 0; i < NEURON_LABELS.length; i++) {
+      const label = NEURON_LABELS[i];
+      const color = NEURON_COLORS[i];
+      const pos   = NEURON_POSITIONS[i];
+      const entry = manifestByLabel[label];
+
+      let group;
+      if (entry?.available) {
+        try {
+          group = await loadMeshNeuron(label, color, entry.bodyId);
+        } catch (err) {
+          console.warn(`[${label}] OBJ load failed, using procedural:`, err);
+          group = buildNeuronGroup(color, i, 1.0);
+        }
+      } else {
+        group = buildNeuronGroup(color, i, 1.0);
+      }
+
+      const hitSphere = new THREE.Mesh(
+        new THREE.SphereGeometry(50, 8, 6),
+        new THREE.MeshBasicMaterial({ visible: false }),
+      );
+      hitSphere.userData.neuronLabel = label;
+      group.add(hitSphere);
+
+      // tag every mesh
+      group.userData.neuronLabel = label;
+      group.traverse(child => { child.userData.neuronLabel = label; });
+
+      group.position.copy(pos);
+      this._scene.add(group);
+      this._neuronGroups.set(label, group);
+      this._neuronPositions.set(label, pos.clone());
+
+      const el       = document.createElement('div');
+      const hexColor = `#${color.toString(16).padStart(6, '0')}`;
+      el.className   = 'neuron-label';
+      el.textContent = label;
+      el.dataset.origColor = hexColor;
+      el.style.color      = hexColor;
+      el.style.textShadow = `0 0 8px ${hexColor}`;
+      labelsContainer.appendChild(el);
+      this._labelEls.set(label, el);
+
+      if (onProgress) onProgress(i + 1, NEURON_LABELS.length);
+    }
+  }
+
+  // per-frame animation
+
+  _animate() {
+    requestAnimationFrame(() => this._animate());
+    const delta = this._clock.getDelta();
+
+    if (this._autoRotate && !this._userInteracting) {
+      const angle  = -(2 * Math.PI / 60) * 0.18 * delta;
+      const target = this._controls.target;
+      const offset = this._camera.position.clone().sub(target);
+      offset.applyAxisAngle(new THREE.Vector3(0, 1, 0), angle);
+      this._camera.position.copy(target).add(offset);
+      this._camera.lookAt(target);
+    }
+
+    this._controls.update();
+    this._camera.updateMatrixWorld();
+    drainBloomQueue(delta);
+
+    for (let i = this._tickFns.length - 1; i >= 0; i--) {
+      const done = this._tickFns[i](delta);
+      if (done) this._tickFns.splice(i, 1);
+    }
+
+    this._updateLabelPositions();
+    this._composer.render();
+  }
+
+  _updateLabelPositions() {
+    const hw = window.innerWidth  / 2;
+    const hh = window.innerHeight / 2;
+    for (const [label, el] of this._labelEls) {
+      const v = this._neuronPositions.get(label).clone().project(this._camera);
+      const x = v.x * hw + hw + 12;
+      const y = -v.y * hh + hh - 14;
+      el.style.transform = `translate3d(${x}px,${y}px,0) translate(-50%,-50%)`;
+      el.style.display   = v.z < 1 ? 'block' : 'none';
+    }
+  }
+
+  /**
+   * light up the given neuron as the current firing neuron
+   * stop and resets whichever neuron was previously lit
+   */
+  fireNeuron(label, type) {
+    // Reset the previously firing neuron
+    if (this._currentFiringStop) {
+      this._currentFiringStop();
+      this._currentFiringStop = null;
+    }
+    if (this._currentFiringLabel) {
+      const prevEl = this._labelEls.get(this._currentFiringLabel);
+      if (prevEl) {
+        prevEl.classList.remove('firing');
+        prevEl.style.color = prevEl.dataset.origColor ?? '';
+      }
+    }
+    this._currentFiringLabel = label;
+
+    const group = this._neuronGroups.get(label);
+    if (!group) return;
+
+    this._currentFiringStop = startFiringAnimation(group, type);
+
+    // set firing neuron label to white
+    const firingEl = this._labelEls.get(label);
+    if (firingEl) {
+      firingEl.classList.add('firing');
+      firingEl.style.color = '#ffffff';
+    }
+
+    // brief particle burst on transition
+    const color = type === 'E' ? EXC_COLOR : INH_COLOR;
+    spawnParticleBurst(this._scene, this._neuronPositions.get(label), color, 22);
+  }
+
+  /** draw a synapse arc after user answers. */
+  fireSynapseArc(fromLabel, toLabel, correct, type) {
+    const from = this._neuronPositions.get(fromLabel);
+    const to   = this._neuronPositions.get(toLabel);
+    if (!from || !to) return;
+
+    const { tick, dispose } = spawnPersistentArc(this._scene, from, to, correct, type);
+    this._persistentArcs.push(dispose);
+    this._tickFns.push(tick);
+  }
+
+  getNeuronPosition(label) {
+    return this._neuronPositions.get(label)?.clone() ?? null;
+  }
+
+  disableAutoRotate()  { this._autoRotate = false; }
+  enableAutoRotate()   { this._autoRotate = true;  }
+
+  setupNeuronClickHandler(callback) {
+    const dom = this._renderer.domElement;
+    let downX = 0, downY = 0;
+    dom.addEventListener('mousedown', e => { downX = e.clientX; downY = e.clientY; });
+    dom.addEventListener('click', e => {
+      if (Math.hypot(e.clientX - downX, e.clientY - downY) > 5) return;
+      const label = this._raycastNeuron(e.clientX, e.clientY);
+      if (label) callback(label, e.clientX, e.clientY);
+    });
+  }
+
+  _raycastNeuron(clientX, clientY) {
+    const rect   = this._renderer.domElement.getBoundingClientRect();
+    const clickX = clientX - rect.left;
+    const clickY = clientY - rect.top;
+    const hw     = rect.width  / 2;
+    const hh     = rect.height / 2;
+
+    const project = (pos) => {
+      const v = pos.clone().project(this._camera);
+      if (v.z >= 1) return null;   // behind camera
+      return { sx: v.x * hw + hw, sy: -v.y * hh + hh };
+    };
+
+    // check if click is within a radius of firing neuron
+    if (this._currentFiringLabel) {
+      const pos = this._neuronPositions.get(this._currentFiringLabel);
+      if (pos) {
+        const p = project(pos);
+        if (p && Math.hypot(clickX - p.sx, clickY - p.sy) < 120) {
+          return this._currentFiringLabel;
+        }
+      }
+    }
+
+    let bestLabel = null;
+    let bestDist  = Infinity;
+    for (const [label, pos] of this._neuronPositions) {
+      const p = project(pos);
+      if (!p) continue;
+      const d = Math.hypot(clickX - p.sx, clickY - p.sy);
+      if (d < bestDist) { bestDist = d; bestLabel = label; }
+    }
+    return bestLabel;
+  }
+
+  stopFiringAnimation() {
+    if (this._currentFiringStop) {
+      this._currentFiringStop();
+      this._currentFiringStop = null;
+    }
+    if (this._currentFiringLabel) {
+      const el = this._labelEls.get(this._currentFiringLabel);
+      if (el) {
+        el.classList.remove('firing');
+        el.style.color = el.dataset.origColor ?? '';
+      }
+      this._currentFiringLabel = null;
+    }
+  }
+
+  /**
+   * full reset for a new game:
+   */
+  resetForNewGame() {
+    this.stopFiringAnimation();
+    this._persistentArcs.forEach(d => d());
+    this._persistentArcs = [];
+  }
+}
